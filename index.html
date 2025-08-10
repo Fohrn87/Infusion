@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="no">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+  <title>Droppeteller – mobil</title>
+  <style>
+    html, body { margin:0; padding:0; background:#0b0b0f; color:#fff; font-family:system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    #app { display:flex; flex-direction:column; gap:8px; padding:10px; max-width:900px; margin:0 auto; }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .card { background:#11131a; border:1px solid #232634; border-radius:14px; padding:10px; }
+    label { font-size:14px; opacity:.9; }
+    input, button, select { background:#0f1219; color:#fff; border:1px solid #2a2f3d; border-radius:10px; padding:8px 12px; font-size:14px; }
+    button { cursor:pointer; }
+    #video { width:100%; max-height:50vh; background:#000; border-radius:14px; }
+    #canvas { width:100%; max-height:50vh; background:#000; border-radius:14px; }
+    #overlay { position:absolute; inset:0; pointer-events:none; }
+    .metrics { display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:8px; }
+    .metric { background:#0f1219; border:1px solid #2a2f3d; border-radius:14px; padding:10px; text-align:center; }
+    .metric .v { font-size:24px; font-weight:700; }
+    .metric .k { font-size:12px; opacity:.8; }
+    .warn { color:#ffd166; }
+    .ok { color:#7ae582; }
+    .footer { font-size:12px; opacity:.7; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div class="row" style="justify-content:space-between;">
+      <div style="font-weight:700; font-size:18px;">Droppeteller – mobil (kamera)</div>
+      <div style="font-size:12px; opacity:.75;">Beta • Ikke medisinsk utstyr</div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <button id="btnStart">Start kamera</button>
+        <button id="btnToggle" disabled>Pause</button>
+        <button id="btnReset" disabled>Nullstill</button>
+        <button id="btnRoi" disabled>Sett ROI</button>
+        <select id="facing">
+          <option value="environment" selected>Bak-kamera</option>
+          <option value="user">Front-kamera</option>
+        </select>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <label>Dråpefaktor (gtt/mL): <input id="dropFactor" type="number" value="20" step="1" min="5" max="120" style="width:90px"/></label>
+        <label>Følsomhet: 
+          <select id="sensitivity">
+            <option value="low">Lav</option>
+            <option value="medium" selected>Middels</option>
+            <option value="high">Høy</option>
+          </select>
+        </label>
+      </div>
+    </div>
+
+    <div class="card">
+      <video id="video" playsinline muted></video>
+      <canvas id="canvas"></canvas>
+      <div class="metrics" style="margin-top:8px;">
+        <div class="metric"><div class="v" id="mDrops">0</div><div class="k">Dråper</div></div>
+        <div class="metric"><div class="v" id="mDpm">0.0</div><div class="k">DPM</div></div>
+        <div class="metric"><div class="v" id="mMlh">0.0</div><div class="k">mL/h</div></div>
+      </div>
+      <div id="status" class="footer" style="margin-top:6px;">Gi tilgang til kamera og pek ROI rundt dråpekammeret.</div>
+    </div>
+
+    <div class="footer">Tips: Stabilt feste av telefonen, jevn belysning og kontrast mellom dråper og bakgrunn gir best resultat.</div>
+  </div>
+
+  <!-- OpenCV.js (WASM) -->
+  <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady()"></script>
+  <script>
+    let video = null, canvas = null, ctx = null;
+    let stream = null, running = false, counting = false;
+    let roi = null; // {x,y,w,h}
+    let lastFrame = null; // cv.Mat
+    let lastDropMs = 0;
+    let emaDpm = null;
+    let intervals = [];
+    let minIntervalMs = 250;
+    const emaAlpha = 0.2;
+
+    function $(id){ return document.getElementById(id); }
+
+    function setStatus(text, klass){
+      const s = $("status");
+      s.textContent = text;
+      s.className = "footer " + (klass||"");
+    }
+
+    function updateSensitivity(){
+      const s = $("sensitivity").value;
+      if (s === 'low') minIntervalMs = 350;
+      else if (s === 'high') minIntervalMs = 180;
+      else minIntervalMs = 250;
+    }
+
+    function computeMlh(){
+      const dpm = emaDpm || 0;
+      const df = parseFloat($("dropFactor").value || '20');
+      return (dpm/df)*60.0;
+    }
+
+    function updateMetrics(){
+      $("mDrops").textContent = drops;
+      $("mDpm").textContent = (emaDpm||0).toFixed(1);
+      $("mMlh").textContent = computeMlh().toFixed(1);
+    }
+
+    let drops = 0;
+
+    async function startCamera(){
+      if (stream) { stream.getTracks().forEach(t=>t.stop()); }
+      const facingMode = $("facing").value;
+      try{
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode, width:{ideal:1280}, height:{ideal:720} }, audio:false });
+      }catch(e){ setStatus('Kunne ikke starte kamera: '+e.message, 'warn'); return; }
+      video.srcObject = stream; await video.play();
+      canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+      $("btnToggle").disabled = false; $("btnReset").disabled = false; $("btnRoi").disabled = false;
+      setStatus('Kamera i gang. Trykk "Sett ROI" og marker området rundt dråpekammeret.');
+    }
+
+    function pickDefaultRoi(){
+      const w = canvas.width, h = canvas.height;
+      const rw = Math.round(w*0.22), rh = Math.round(h*0.78);
+      const rx = Math.round((w-rw)/2), ry = Math.round((h-rh)/2);
+      roi = {x:rx, y:ry, w:rw, h:rh};
+    }
+
+    function drawFrame(mat){
+      cv.imshow(canvas, mat);
+      const g = canvas.getContext('2d');
+      if (roi){
+        g.save();
+        g.strokeStyle = 'rgba(255,255,0,.9)'; g.lineWidth = 3; g.strokeRect(roi.x, roi.y, roi.w, roi.h);
+        const lineY = roi.y + Math.round(roi.h*0.6);
+        g.strokeStyle = 'rgba(0,255,255,.9)'; g.beginPath(); g.moveTo(roi.x, lineY); g.lineTo(roi.x+roi.w, lineY); g.stroke();
+        g.restore();
+      }
+    }
+
+    function chooseRoiWithTouch(){
+      setStatus('Dra for å markere ROI. Dobbeltrykk for å bruke standard.');
+      const g = canvas.getContext('2d');
+      let start = null;
+      function onDown(e){
+        const rect = canvas.getBoundingClientRect();
+        const x = (e.touches?e.touches[0].clientX:e.clientX) - rect.left;
+        const y = (e.touches?e.touches[0].clientY:e.clientY) - rect.top;
+        start = {x,y};
+      }
+      function onMove(e){ if(!start) return; const rect = canvas.getBoundingClientRect(); const x=(e.touches?e.touches[0].clientX:e.clientX)-rect.left; const y=(e.touches?e.touches[0].clientY:e.clientY)-rect.top; roi = {x:Math.min(start.x,x)|0, y:Math.min(start.y,y)|0, w:Math.abs(x-start.x)|0, h:Math.abs(y-start.y)|0}; }
+      function onUp(){ start=null; setStatus('ROI satt. Trykk Pause/Start for å telle.','ok'); canvas.removeEventListener('mousedown',onDown); canvas.removeEventListener('mousemove',onMove); canvas.removeEventListener('mouseup',onUp); canvas.removeEventListener('touchstart',onDown); canvas.removeEventListener('touchmove',onMove); canvas.removeEventListener('touchend',onUp); }
+      function onDbl(){ pickDefaultRoi(); onUp(); }
+      canvas.addEventListener('mousedown', onDown); canvas.addEventListener('mousemove', onMove); canvas.addEventListener('mouseup', onUp);
+      canvas.addEventListener('touchstart', onDown); canvas.addEventListener('touchmove', onMove); canvas.addEventListener('touchend', onUp);
+      canvas.addEventListener('dblclick', onDbl, {once:true});
+    }
+
+    function processLoop(){
+      if (!running) return;
+      const frame = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC4);
+      const rgba = new cv.Mat();
+      const gray = new cv.Mat();
+
+      try{
+        // capture frame
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        frame.data.set(imageData.data);
+
+        // grayscale + blur
+        cv.cvtColor(frame, rgba, cv.COLOR_RGBA2RGB);
+        cv.cvtColor(rgba, gray, cv.COLOR_RGB2GRAY);
+        cv.GaussianBlur(gray, gray, new cv.Size(5,5), 0);
+
+        let display = rgba;
+
+        if (roi){
+          const r = new cv.Rect(roi.x, roi.y, Math.max(1,roi.w), Math.max(1,roi.h));
+          const roiMat = gray.roi(r);
+
+          // frame differencing vs previous
+          if (!lastFrame || lastFrame.cols !== roiMat.cols || lastFrame.rows !== roiMat.rows){
+            if (lastFrame) lastFrame.delete();
+            lastFrame = roiMat.clone();
+          }
+          const diff = new cv.Mat();
+          cv.absdiff(roiMat, lastFrame, diff);
+          roiMat.copyTo(lastFrame);
+
+          // threshold + morphology
+          const th = new cv.Mat();
+          cv.threshold(diff, th, 25, 255, cv.THRESH_BINARY);
+          const kernel = cv.Mat.ones(3,3, cv.CV_8U);
+          cv.morphologyEx(th, th, cv.MORPH_OPEN, kernel);
+          cv.morphologyEx(th, th, cv.MORPH_CLOSE, kernel);
+
+          // contours
+          const contours = new cv.MatVector();
+          const hierarchy = new cv.Mat();
+          cv.findContours(th, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+          // line crossing
+          const lineY = roi.y + Math.round(roi.h*0.6);
+          let nowMs = performance.now();
+          for (let i=0; i<contours.size(); i++){
+            const cnt = contours.get(i);
+            const rect = cv.boundingRect(cnt);
+            const area = rect.width*rect.height;
+            if (area < 20 || rect.height < 6 || rect.height > roi.h*0.6) continue;
+            const cx = rect.x + rect.width/2 + roi.x;
+            const cy = rect.y + rect.height/2 + roi.y;
+            if (Math.abs(cy - lineY) <= 5){
+              if (nowMs - lastDropMs >= minIntervalMs){
+                // count
+                if (window._prevEventMs === undefined) window._prevEventMs = nowMs; else {
+                  const dt = nowMs - window._prevEventMs; window._prevEventMs = nowMs;
+                  if (dt >= 150 && dt <= 8000){
+                    intervals.push(dt); if (intervals.length > 10) intervals.shift();
+                    const instDpm = 60000.0 / dt;
+                    emaDpm = (emaDpm==null) ? instDpm : (emaAlpha*instDpm + (1-emaAlpha)*emaDpm);
+                  }
+                }
+                drops += 1; lastDropMs = nowMs; updateMetrics();
+              }
+            }
+          }
+
+          // draw debug mask small into display
+          // (skip to save CPU on low-end phones)
+
+          contours.delete(); hierarchy.delete(); th.delete(); diff.delete(); kernel.delete();
+        }
+
+        drawFrame(display);
+      } catch(e){
+        setStatus('Feil i prosessering: '+e.message, 'warn');
+      } finally {
+        frame.delete(); rgba.delete(); gray.delete();
+      }
+
+      if (counting) requestAnimationFrame(processLoop); else running=false;
+    }
+
+    function toggleCounting(){
+      if (!stream) return;
+      counting = !counting;
+      $("btnToggle").textContent = counting ? 'Pause' : 'Start';
+      setStatus(counting ? 'Telling START' : 'Telling PAUSE');
+      if (counting){ running=true; requestAnimationFrame(processLoop); }
+    }
+
+    function resetAll(){
+      drops = 0; emaDpm = null; intervals.length = 0; lastDropMs = 0; window._prevEventMs = undefined; updateMetrics(); setStatus('Nullstilt');
+    }
+
+    function onOpenCvReady(){
+      window.onOpenCvReady = () => { setStatus('OpenCV.js lastet. Start kamera.','ok'); };
+    }
+
+    // init UI
+    window.addEventListener('DOMContentLoaded', () => {
+      video = $("video"); canvas = $("canvas"); ctx = canvas.getContext('2d');
+      $("btnStart").onclick = async ()=>{ await startCamera(); pickDefaultRoi(); counting=true; running=true; updateSensitivity(); requestAnimationFrame(processLoop); };
+      $("btnToggle").onclick = toggleCounting;
+      $("btnReset").onclick = resetAll;
+      $("btnRoi").onclick = chooseRoiWithTouch;
+      $("dropFactor").onchange = updateMetrics;
+      $("sensitivity").onchange = ()=>{ updateSensitivity(); setStatus('Følsomhet endret.'); };
+      $("facing").onchange = startCamera;
+    });
+  </script>
+</body>
+</html>
